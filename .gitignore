@@ -1,0 +1,17 @@
+# Operating-system and editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+
+# Local caches and temporary files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.tmp
+*.log
+
+# Generated validation or build output
+dist/
+build/
+coverage/

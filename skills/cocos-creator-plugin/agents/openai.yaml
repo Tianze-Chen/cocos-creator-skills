@@ -1,0 +1,4 @@
+interface:
+  display_name: "Cocos Creator Plugin"
+  short_description: "Build and debug Cocos Creator editor extensions"
+  default_prompt: "Use $cocos-creator-plugin to build or debug a Cocos Creator editor extension."

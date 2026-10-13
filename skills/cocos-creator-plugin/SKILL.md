@@ -11,6 +11,32 @@ description: Use when scaffolding, extending, or debugging a Cocos Creator (3.8.
 
 引擎侧的结论额外对着 **Cocos 4.0.0-alpha.31** 源码核过一遍，标了「3.8 / 4.0 一致」的那些可以跨这两个大版本用；没标的只保证 3.8.8。
 
+## 路由：这些问题不在本 skill
+
+本 skill 只管「编辑器扩展怎么写」。同一生态里相邻、但不属于插件开发的问题，按这张表去对应的 skill：
+
+| 问题 | 去哪 |
+|---|---|
+| **资源数据格式**：手写/解析 `.anim`/`.prefab`/`.scene`（`__id__` 容器、内联规则）、AnimationClip JSON、Spine `skeleton.json` + `.atlas`（双版本格式、vendored spine-cpp 4.3 逐字段规则）、`.plist` 两代键名、SpriteFrame trim/offset、`library/*.json` 里的产物形状 | **cocos-asset-formats** skill |
+| **微信小游戏多线程 Worker**：`wx.createWorker`、worker 分包、V2 灰度（OffscreenCanvas / SharedArrayBuffer / worker 内 wx API / 多 worker）、「把解码搬进 worker」行不行 | **wechat-minigame-worker** skill |
+| **不开编辑器写场景**：手写 `.scene`/`.meta`、压缩 uuid `__type__`、静态 UI 序列化进场景、`cc.ClickEvent` 点击绑定、运行时建节点/UI | **cocos-creator-scene-authoring** skill |
+
+判断口诀沿用 §0 那条分界线：「插件怎么写」看编辑器版本、在本 skill；「资源长什么样 / 能不能播」是引擎侧格式问题、在上表第一个 skill。
+
+## 章节地图：按任务直达
+
+| 任务 | 直达 |
+|---|---|
+| 确认编辑器/引擎版本、挖编辑器内部事实 | §0 |
+| 想清楚这次改动落在哪个进程 | §1 |
+| 选贡献点 / 写 package.json / 主进程 / 面板 | §2–3 |
+| 自定义资源类型、导入器、UUID、刷新、引用 | §3.4、§4 |
+| 「没反应」「报错误地方」「黑屏 / 卡住」 | §5 |
+| 装进目标工程、免 GUI 构建、CLI typecheck | §6 |
+| 包体估算、功能裁剪、tree-shaking | §7 |
+| 原生 C++（JSB）与 wasm 双后端 | §8 |
+| 模拟器（原生 exe）预览 | §9 |
+
 ## 0. 动手前先确认版本（两分钟，能省几小时）
 
 ### 编辑器壳的版本 ≠ 引擎的版本
@@ -73,7 +99,7 @@ grep -c 'Can not find the importer'    "$L"  # 健康 = 0
    #   blank/ html-panel/ vue2.x-panel/ vue3.x-panel/                ← 官方模板
    cat /tmp/ax/builtin/*/package.json                # 19 个内置扩展，明文，贡献点的唯一事实来源
    ```
-   **schema 只管顶层字段和 `panels`；`contributions` 的 schema 是故意空的**，所以贡献点形态只能照内置扩展抄。
+   **schema 只管顶层字段和 `panels`；`contributions` 的 schema 是故意空的**，所以贡献点形态只能照内置扩展抄（写法依据集中在 §3.1）。
 3. **编辑器的类型声明**（在 `app.asar` 里，但 `.d.ts` 是明文）：
    ```bash
    npx @electron/asar list  /Applications/Cocos/Creator/<版本>/CocosCreator.app/Contents/Resources/app.asar | grep '\.d\.ts'
@@ -81,6 +107,7 @@ grep -c 'Can not find the importer'    "$L"  # 健康 = 0
    ```
    `node_modules/@cocos/creator-types/editor/**` 下面是全套编辑器 API 声明。
    ⚠️ **实现是 `.ccc`，加密的**（`asset-handler-manager.ccc`、`libs/importer.ccc`），解不开。所以导入器的内部行为只能靠观测，没有静态替代路径。
+   **但别把「编辑器内部读不了」扩大化**（2026-09 实测）：加密的只有 `.ccc`；`@editor/creator` 各模块的 `.jsg` 是 **gzip**（`gunzip` 即明文 JS，消息路由就是这样反编译确认无权限门槛的，见 §9.3）；**builtin 扩展的 `dist/**/*.js` 干脆就是明文**（`builtin/preview/dist/browser/simulator.js` 等直接可读）。查编辑器行为时先看这三层里哪层可读，再谈观测。
 4. **真实工程的产物**：`<工程>/library/**/*.json` 是**已被当前引擎序列化过**的资源，是最可靠的格式样本；`<工程>/temp/asset-db/log/*.log` 是导入/注册的真实时间线；`<工程>/temp/logs/project.log` 是扩展加载和面板注册的真实时间线（`warn:` 行往往是唯一的线索，见 §5）。
 
 **`extract-file` 只往 stdout 写、不落盘**，用它取多个文件时记得重定向；一次要看好几个的话直接 `extract` 整包更省事。
@@ -114,16 +141,17 @@ await Editor.Message.request('scene', 'execute-scene-script', {
 | 想要的能力 | 需要的贡献点 |
 |---|---|
 | 自定义资源类型（`.xxx` → 自定义 Asset 类） | `asset-db.script` + `asset-db.asset-handler` |
-| 把 TS 运行时代码交付给游戏（组件 / 资源类） | `asset-db.mount`（只读挂载） |
+| 把 TS 运行时代码交付给游戏（组件 / 资源类） | `asset-db.mount`（只读挂载；**挂进去的每个脚本都进包，见 §7.1**） |
 | 资源面板右键菜单 | `assets.menu` |
 | 参数弹窗 / 工具窗口 | `panels` |
+| 存一份用户配置（偏好 / 工程设置） | `contributions.profile` 或 `contributions.preferences` + `Editor.Profile`（见 §3.9） |
 | 拖资源到已有节点的 Inspector 自动加组件 | `inspector.drop` + `messages` + 主进程转发 |
 | 拖资源进层级面板自动建节点 | `scene.script` |
 | 组件 / 资源自定义 Inspector 面板 | `inspector.section` |
 | 被别的扩展或批处理脚本调用 | `messages` 里 `"public": true` |
 | 监听资源变动 | `messages` 里订阅 `asset-db:asset-add` / `asset-db:asset-change` |
-| 原生 C++ 运行时 | `native.plugins` + `native/cc_plugin.json`（见 §8） |
-| Web / 小游戏也要同一套原生逻辑 | 独立 wasm（Emscripten + embind）+ `builder` 贡献复制产物（见 §8） |
+| 原生 C++ 运行时 | `native.plugins` + `native/cc_plugin.json`（**仅 android / windows / ios / mac**，见 §8.1） |
+| Web / 小游戏也要同一套原生逻辑 | 独立 wasm（Emscripten，embind 可选）+ `builder` 贡献复制产物 + `main.js` 拷进引擎 `native/external/`（见 §8.3–8.4） |
 
 **决策规则**：
 - 只要涉及「自定义资源类型」，`asset-db.script` + `asset-handler` 是最小闭环。
@@ -134,17 +162,7 @@ await Editor.Message.request('scene', 'execute-scene-script', {
 
 ### 3.1 package.json
 
-**先说依据，因为这一节以前是靠记忆写的、错了三处。** 3.8.8 的 asar 里带着两份明文权威材料：
-
-```
-modules/editor-extensions/extensions/extension/static/extension-template/
-    template/@types/schema/package/index.json        ← package.json 顶层的 JSON schema
-    template/@types/schema/package/base/panels.json  ← panels 的 JSON schema
-    html-panel/package.json                          ← 官方带面板模板
-    blank/ vue2.x-panel/ vue3.x-panel/               ← 另三个官方模板
-```
-
-**但 schema 只覆盖顶层字段和 `panels`**——`contributions/index.json` 是**故意留空的**（`"properties": {}`），因为每个宿主包自己定义自己的 key。所以贡献点的形态没有 schema，唯一的事实来源是**内置扩展自己的 `package.json`**（`builtin/*/package.json`，明文，19 个）。下面每一条都注明了照的是哪一个。
+**先说依据，因为这一节以前是靠记忆写的、错了三处。** 权威材料就是 §0 通道 2 那两处：`extension-template` 里的 JSON schema（只覆盖 package.json **顶层字段**和 `panels`）与 19 个内置扩展的明文 `package.json`（`builtin/*/package.json`）。**`contributions` 的 schema 是故意留空的**（`"properties": {}`，每个宿主包自定义 key），所以贡献点形态没有 schema，唯一事实来源是内置扩展——下面每一条都注明了照的是哪一个。
 
 ```json
 {
@@ -335,7 +353,7 @@ export function assetMenu(assetInfo: { uuid: string; url: string; isDirectory?: 
 
 ### 3.6 拖到 Inspector（`inspector.drop`）
 
-贡献点的**声明**形态是确定的（照 `builtin/animator/package.json`，见 §3.1）：`{ node: [{ type: '<资源 ccclass 名>', message }] }`。
+贡献点的**声明**形态照 `builtin/animator/package.json`，形态与易错点见 §3.1。
 
 ⚠️ 但**回调实参形态在 3.8.x 没有公开签名**（内置 animator 走的是同一条通道，实现编译在 `app.asar` 里读不到）。历史上见过 `(dropItem, dumps, uuidList)` 这种三参形态，但**不要当成事实**。
 
@@ -397,6 +415,23 @@ export function createNode(name: string) {
     return node?.uuid ?? null;
 }
 ```
+
+### 3.9 存一份配置：三个宿主，先按「存在哪」选
+
+三条路都能给用户一个 checkbox，区别只在**值存到哪个文件、什么时候能读到**。先想清楚这个，再选 UI：
+
+| 宿主 | 值落在哪 | 什么时候读得到 | 适合 |
+|---|---|---|---|
+| `contributions.preferences` | 默认全局（`~/.CocosCreator/`），偏好设置面板每项有「将配置存储到项目」的开关 | 编辑期任意时刻 | 个人习惯（日志开关、默认路径） |
+| `contributions.profile` + `Editor.Profile` | `'project'` → `<工程>/settings/v2/packages/<name>.json`（**随工程提交**）；`'local'` → 工程内不提交；`'global'` → 跨工程 | 编辑期任意时刻 | 团队要共享、要可复现的决策（包体、输出格式） |
+| `IBuildPluginConfig.options` | 构建配置，随构建平台参数走 | **只有构建时**，经 `options.packages['<扩展名>']` 进钩子 | 只影响本次产物的参数 |
+
+- 声明式 checkbox 的写法：`contributions.preferences.properties` 里是**扁平的** `{ ui, attributes, items }`（照 `builtin/asset-db` / `builtin/builder` 的 `package.json`）。**这和 `builtin/preferences/@types/index.d.ts` 里写的 `render: { ui }` 不一致 —— 以 builtin 的实际写法为准**，类型声明那份是旧的。
+- `contributions.profile` 的形态是 `{ editor: {...}, project: { <key>: { default, label?, message? } } }`（`builtin/engine/package.json` 同时用了两半）。`message` 是值变化时编辑器广播的那条消息名，用它做「改了就立刻生效」。
+- 读写就是 `Editor.Profile.getProject(pkg, key, 'project')` / `setProject(pkg, key, value, 'project')`，以及 `getConfig` / `setConfig(…, 'local' | 'global')`。`getProject` 在没存过时**返回 `contributions.profile.project.<key>.default`**，所以不用自己写「首次运行」分支 —— 但仍然要把读到的值过一遍归一化函数（老配置缺 key、有人手改成字符串）。
+- **随工程存 ⇒ 扩展必须装在 `<工程>/extensions/` 下。** 装在全局目录时一份扩展目录被所有工程共用，而配置是每个工程一份，任何「按配置改扩展自己目录里的文件」的设计都会在切工程时来回打架。这种扩展应当在 `load()` 里用 `path.relative(Editor.Project.path, __dirname)` 检测自己在不在工程内，不在就打一条 warning。
+
+**时序结论（决定了架构，不只是选型）**：构建面板的 `options` **管不了 asset-db 里有什么**。构建开始时脚本清单已经定了，最早的钩子 `onBeforeBuild` 也已经太晚。所以任何「哪些脚本进包」的开关都**必须是编辑期配置**，放构建面板会做出「勾了但这次构建没生效」这种最坏的交互。
 
 ## 4. 资源侧的 3.8.8 实测事实
 
@@ -541,92 +576,48 @@ export function consumeSelfWrite(uuid: string): boolean {
 
 **所以「不会自激循环」这个检查项要按方向拆开验**，写成一条必然漏——我就是先修好了产物方向、以为完事，第一次成功烘焙立刻撞上写-meta 方向。它还有个额外的误导性：循环的第一轮日志里常常还留着别的报错，于是很容易以为循环是**失败重试**造成的，而它其实是**成功**路径触发的。
 
-### 4.4 手写 Cocos 序列化格式（`.anim` 为例）
+### 4.3.3 外部工具拷入资源后「预览找不到」：三层状态各自为政
 
-`.anim` / `.prefab` / `.scene` 都是同一种格式：**一个数组，元素之间用 `{"__id__": n}` 互相引用**，0 号是入口对象。
+外部拷文件进 `assets/`（编辑器失焦期），焦点时刻 `refresh-all-database` 会补账导入，但**导入成功 ≠ 预览能加载**。三层状态，任何一层滞后都表现成同一个报错（`Bundle resources doesn't contain <path>`），排查要逐层验：
 
-内联规则：**被 `@uniquelyReferenced` 标记的类内联**成 `{"__type__": ..., ...}`，其余 CCClass 实例在顶层数组里各占一格。反序列化器两种形态都吃，但照着序列化器的选择写，才不会「打开再保存就产生 diff」。
+| 层 | 验法（全部 HTTP/文件，不需要碰编辑器 UI） | 滞后时的症状 |
+|---|---|---|
+| ① asset-db 登记 | `library/.assets-info.json` 的 **`map` 键**：`{map:{'resources\\x\\y.json':{time,uuid}}}`。注意值是 `time/uuid`——按 `value.source` 之类字段查必得 0 条，形状要看清 | map 没条目 = 导入没跑成 |
+| ② library 产物 | `library/<uuid前2>/<uuid>.json`（payload）+ 源文件旁 `.meta` | 有 meta 没 payload 或反之 = 半途 |
+| ③ 预览的 bundle config | `GET http://localhost:7456/assets/resources/config.json`，看 `paths` 里有没有目标路径；项目脚本新旧看 `GET /scripting/x/import-map.json` 里模块映射指向的 chunk 内容 | db 有而 config 没有 = builder 的「查询 Asset Bundle」缓存没失效 |
 
-一条最小的逐帧 SpriteFrame 动画：
+关键机制：**builder 的 bundle 查询缓存只在收到 `asset-db:asset-add/change/delete` 广播时失效**，而失焦补账式的 refresh-all-database 路径不发这个广播。让缓存失效最简单的办法是制造一次**真实**的资源增删（新文件进场 → 焦点循环），而不是只 touch mtime——mtime 变化常常连重新导入都不触发。
+**改工程 TS 后预览吃的可能是旧代码**（2026-09 实证）：工程 TS 只在编辑器窗口**获得焦点**时才重编译。外部工具改完 `assets/scripts/**.ts` 失焦放着，预览页永远跑旧包——URL 参数都在 `location.search`、行为却纹丝不动，极像「参数没生效」的 bug，其实是代码没进包；聚焦后编译还可耗时 >14s。确认编译落地：日志出现 `%cImport%c: …\.ts`，或轮询 `temp/programming/packer-driver/targets/preview/chunks/` 的 chunk 出现新函数名；**判定页面吃的是新包还是旧包，最快探针是 CDP `Runtime.evaluate` 读页面上版本敏感的 Label 文本**（编译失败时 console 什么都不打，日志探针失效）。需要聚焦用 `(New-Object -ComObject WScript.Shell).AppActivate(<编辑器PID>)`，自动化跑批前务必先确认编译落地。改动同时跨 `assets/scripts` 与扩展 `runtime/`（如 spine worker 交付）时，把两边文件全部 touch 后再聚焦一次搞定。
 
-```json
-[
-  { "__type__": "cc.AnimationClip", "_name": "run", "_objFlags": 0, "_native": "",
-    "sample": 12, "speed": 1, "wrapMode": 2, "enableTrsBlending": false,
-    "_duration": 1, "_hash": 0, "_tracks": [{ "__id__": 1 }],
-    "_events": [], "_exoticAnimation": null },
-  { "__type__": "cc.animation.ObjectTrack",
-    "_binding": { "__type__": "cc.animation.TrackBinding", "path": { "__id__": 2 } },
-    "_channel": { "__id__": 4 } },
-  { "__type__": "cc.animation.TrackPath", "_paths": [{ "__id__": 3 }, "spriteFrame"] },
-  { "__type__": "cc.animation.ComponentPath", "component": "cc.Sprite" },
-  { "__type__": "cc.animation.Channel", "_curve": { "__id__": 5 } },
-  { "__type__": "cc.ObjectCurve",
-    "_times": [0, 0.0833, 0.1667],
-    "_values": [
-      { "__uuid__": "<frame0>@ab12c", "__expectedType__": "cc.SpriteFrame" },
-      { "__uuid__": "<frame1>@ab12d", "__expectedType__": "cc.SpriteFrame" },
-      { "__uuid__": "<frame2>@ab12e", "__expectedType__": "cc.SpriteFrame" }
-    ] }
-]
-```
+**watcher 会整个卡死**（长会话实测）：症状三连——新文件不生成 `.meta`、touch 源文件后日志无任何 `%cImport%` 行、失焦/聚焦循环后没有新的 `refresh-all-database` 行。到这一步焦点循环救不回来，**重启编辑器是唯一恢复手段**（`taskkill /PID <主进程>` 再带 `--project` 拉起，1.5 分钟全恢复；预览服务器随之重启，collector 等外部进程不受影响）。
 
-逐字段核对的位置（引擎源码 `cocos/animation/` 下）：`animation-clip.ts`、`tracks/object-track.ts`、`tracks/track.ts`（`TrackBinding` 是那个 `@uniquelyReferenced` 的）、`target-path.ts`（`HierarchyPath.path` / `ComponentPath.component`）。
+### 4.3.4 预览里 `resources.load(path, 扩展自定义资产类)` 必失败：ctor 急切绑定
 
-两个具体的坑：
+引擎 `config.ts` 的 `_initPath` 在 **bundle 初始化时**就急切执行 `assetInfo.ctor = js.getClassById(type)`。预览页的时序是 game.init 预加载 bundles → 场景脚本（含扩展 runtime、`@ccclass('xx.yyData')` 注册）才执行，于是**扩展自定义资产类型的条目 ctor 永远绑成 undefined**。之后 `resources.load(path, MyClass)` 里的类型过滤 `isChildClassOf(undefined, MyClass)` 恒 false，报出来的是**误导性的** `Bundle resources doesn't contain <path>`——资产明明就在 bundle 里。
 
-- **`wrapMode` 要循环必须写 2。** `WrapModeMask`：`Default=0, Normal=1<<0=1, Loop=1<<1=2`（`cocos/core/geometry/curve.ts`）。Creator 自带的迁移 fixture 里写的是 `1`（Normal，只播一遍），照抄就会得到「播一遍就停」。
-- **`_paths` 里空的 hierarchyPath 不要写成 `HierarchyPath('')`。** 动画组件所在节点自身就是不加 `HierarchyPath`；`HierarchyPath('')` 会走 `getChildByPath('')`，warn 一句然后返回 null。
+判别（CDP `Runtime.evaluate` 一条就够）：`cc.assetManager.bundles.get('resources').config.assetInfos.get('<uuid>')` —— `.path` 有值而 `.ctor === undefined` 即此坑。规避：**load 不传 type**（`resources.load(path, null, cb)`），路径查找不做 ctor 过滤，反序列化按载荷 `__type__` 实例化，那时类已注册。构建产物没有这个时序问题（插件脚本先于 game.init 加载），所以该写法在预览/构建两端都成立。
 
-`_hash` 写 0（运行时第一次取的时候自己算）。**拿不准的 `@serializable` 字段就整个省略**——有构造默认值的字段省略后是默认值，而猜错字段名比不写更糟。
-
-**3.8 / 4.0 一致**：上面这些类名、`@uniquelyReferenced` 的位置、`@serializable` 字段名（`_paths` / `path` / `proxy` / `_binding` / `_curve` / `_channel` / `_times` / `_values`）、`WrapModeMask.Loop = 2`，在 3.8.8 和 4.0.0-alpha.31 里逐个核对过，一个没变——`track.ts` 里连行号都一样（60 / 310 / 324 / 453 / 514 / 542 / 561）。`CLASS_NAME_PREFIX_ANIM` 两版都是 `'cc.animation.'`（`animation/define.ts:25`）。`_times` / `_values` 不带 `@serializable` 装饰器，是 `CCClass.fastDefine` 注册的，源码里有注释专门说这事（`core/curves/keyframe-curve.ts:286-295`）。
-
-### 4.5 生成引擎能直接播的资源，路只有这么几条
+### 4.4 生成引擎能直接播的资源，路只有这么几条
 
 | 想要 | 唯一 / 首选路径 | 注意 |
 |---|---|---|
 | `cc.SpriteAtlas` + 逐帧 SpriteFrame 子资源 | 写 TexturePacker **`.plist`** | 3.8.8 的 55 个 asset-handler 里只有两个能产出 SpriteAtlas，另一个是 `auto-atlas` 的 `.pac`，它在**构建期重新打包**，不给你稳定的子资源 |
-| `cc.AnimationClip` | 手写 `.anim`（见 §4.4） | 关键帧引用 UUID，必须在编辑器侧组装 |
-| Spine 动画 | `skeleton.json` + `.atlas` + `.png` | 三个普通文件，**无 UUID 概念**，纯 CLI 就能产出，拖进工程即可 |
-
-`.plist` 两代键名（format 2 `frame`/`offset`/`sourceSize`，format 3 `textureRect`/`spriteOffset`/`spriteSize`/`spriteSourceSize`/`textureRotated`）**同时写出**最稳，代价只有几百字节。
-
-### 4.6 Spine：两个版本、两种互不兼容的 atlas 格式
-
-3.8.8 **内置双版本 spine 运行时**，默认 3.8，可切 4.2。哪个进包看工程配置：
-
-```bash
-grep -o '"spine-[0-9.]*"' <工程>/settings/v2/packages/engine.json | sort -u
-# includeModules 里出现的那个才是构建进包的
-```
-
-`.atlas` 格式必须和运行时版本对上：3.8 世代是 `rotate/xy/size/orig/offset/index`，4.x 是 `bounds/offsets`。**对不上的症状是 region 静默丢失或错位，没有报错。**
-
-判断内置的是哪一代，看引擎里 `cocos/spine/lib/spine-core.d.ts`：有 `setFrame(frameIndex, time, …)` / `rotateMix` / `AtlasRegion{rotate,offsetX,offsetY}` 就是 3.8 世代。**4.0.0-alpha.31 里这几个签名还在**，所以 4.x 默认仍是 3.8 世代的旧 atlas 格式。
-
-引擎侧真正的判定依据是 `cc.config.json` 里那个 module 的 `intrinsicFlags`（`SPINE_3_8` / `SPINE_4_2`），工程侧是 `settings/v2/packages/engine.json` 里 `spine._option`。4.x 还多了一套 `spine-version-dynamic.ts` / `spine-instantiate-dynamic.ts`（运行时可选版本，靠 `moduleOverrides` 换文件）——**如果引擎是这种构建，光看 `SPINE_VERSION` 常量会得到错的答案**，那个文件里的 `export const SPINE_VERSION = '3.8'` 只是给固定版本构建用的占位。
-
-顺带两条：spine 的 `.json` 要和 dragonbones 抢导入器（见 §4.2）；`premultipliedAlpha` 勾错了表现为半透明边缘发暗。
-
-### 4.7 其他零散事实（3.8.8）
-
-- **`SpriteType.MESH` 不可用**：`cocos/2d/components/sprite.ts` 里 `// MESH: 4` 和 `/* || this._type === SpriteType.MESH */` 都是注释掉的。想做紧贴轮廓的 mesh 裁剪得自己写渲染组件。**3.8 / 4.0 一致**，连行号都没动（83 / 385）——别指望升 4.x 会恢复。
-- **SpriteFrame 的 trim 字段齐全**：`_rect` / `_offset` / `_originalSize` / `_rotated`（`cocos/2d/assets/sprite-frame.ts`），序列化出来是 `{__type__, content:{rect, offset, originalSize, rotated, capInsets, vertices, …}}`。逐帧裁剪 + 还原位置用这套原生机制就够，不用自己算顶点。**3.8 / 4.0 一致**。
-- **`SpriteFrame.offset` 是 y 向上的**（裁剪区中心 − 原始帧中心），而 `rect` 是图像坐标系（原点左上）。**同一个文件里混着两种 y 方向**，换算集中到一个函数里，别在多处重算。符号约定看 `_calcTrimmedBorder()`，**3.8 / 4.0 逐行相同**。验它最省事的办法是拿一段**上下移动**的素材烘一遍，看上半的帧 `offset.y` 是不是正的——纯读代码很容易把符号读反。
-- **`cc.SpriteAtlas` 的序列化形状会让人误判**：字段是 `spriteFrames`（**无下划线**）、类型是字典，但它有自定义 `_serialize()` 把字典**摊平成交错数组** `[key0, uuid0, key1, uuid1, …]`。所以在 `library/*.json` 里看到 `content.spriteFrames` 是数组是正常的，不是版本差异（`2d/assets/sprite-atlas.ts:54,113-149`，**3.8 / 4.0 逐行相同**）。
-- **不要凭猜写 `compressSettings`**：它在 Cocos 自己的类型里是 `Record<string, any>` 且带 `TODO`，预设 id 还是项目本地的，猜着写会静默失效。重新生成资源时**完整保留**上一份 `userData` 和每个 `subMetas[*].userData`，第一次导入时提示用户自己设。
+| `cc.AnimationClip` | 手写 `.anim` | 关键帧引用 UUID，必须在编辑器侧组装；**序列化格式见 cocos-asset-formats skill** |
+| Spine 动画 | `skeleton.json` + `.atlas` + `.png` | 三个普通文件，**无 UUID 概念**，纯 CLI 就能产出，拖进工程即可。格式细节（双版本 atlas / vendored spine-cpp 解析器规则）见 **cocos-asset-formats** skill |
 
 ## 5. 调试与验证
 
-- **静默失败优先怀疑五个地方**：`set-property` 写了不存在的属性（§3.7）、`.meta` 里 importer 被复用（§4.2）、面板主文件用了 `export default`（§3.3）、`package.json` 缺 `package_version`（§3.1，症状是扩展管理器里看不见但其实已加载）、**`panels` 被写进了 `contributions` 里**（§3.1，症状是扩展一切正常只有开面板报 `Panel(...) is not defined`）。这五样都不报错，或者只报一行指向错方向的 warn。
-- **`package.json` 结构错位这一类问题，症状永远指向错的地方**：扩展照常加载、消息照常收发、菜单照常出，于是你会去查脚本、查 `module.exports`、查路径，而错的地方在 JSON 的缩进层级里。所以贡献点**照着 §3.1 的 schema 和内置扩展抄，不要凭记忆写**——我凭记忆写的那份骨架，`panels` 位置、`assets.menu` 形态、`inspector.drop` 形态三处全错。
-- **Cocos 报错的位置和真正的错误位置几乎从不重合**，上面那条只是其中一例。`Panel(...) is not defined` 指向面板脚本而错在 `package.json`；`parameter error` 指向 asset-db 内部而错在你某个循环的边界条件（§4.3.1）；`.effect` 下载失败 / 渲染管线为 null / 材质属性非法这一整串场景报错，错在**引擎目录的 `package.json`** 被换掉了（§0）。而栈都在 `.ccc` 里，看不了。**所以顺序是「先给每个跨进程调用加上带实参的标签，再开始分析」**——加标签的收益是确定的，分析的收益不是。
+- **静默失败优先怀疑五个地方**（都不报错，或只报一行指向错方向的 warn）：`set-property` 写了不存在的属性（§3.7）、`.meta` 里 importer 被复用（§4.2）、面板主文件用了 `export default`（§3.3）、`package.json` 缺 `package_version`（§3.1，症状是扩展管理器里看不见但其实已加载）、**`panels` 被写进了 `contributions` 里**（§3.1，症状是扩展一切正常、只有开面板报 `Panel(...) is not defined`）。根源对策：贡献点**照 §3.1 的 schema 和内置扩展抄，不要凭记忆写**——凭记忆写的那份骨架三处全错（`panels` 位置、`assets.menu` 形态、`inspector.drop` 形态），症状全都指向别处（查脚本、查 `module.exports`、查路径），错的地方其实在 JSON 的缩进层级里。
+- **Cocos 报错的位置和真正的错误位置几乎从不重合**：`Panel(...) is not defined` 指向面板脚本而错在 `package.json`；`parameter error` 指向 asset-db 内部而错在你某个循环的边界条件（§4.3.1）；`.effect` 下载失败 / 渲染管线为 null / 材质属性非法这一整串场景报错，错在**引擎目录的 `package.json`** 被换掉了（§0）。栈还都在 `.ccc` 里看不了。**所以顺序是「先给每个跨进程调用加上带实参的标签，再开始分析」**——加标签的收益是确定的，分析的收益不是。
 - **不是所有失败都安静**：也有反过来的——**扩展在后台无限重复干活**。如果它既写资源又监听资源变动，先怀疑自激循环（§4.3.2），判据是日志里同样几行按固定周期重复。这个不看日志基本发现不了，因为 UI 上什么都不弹。
+- **「卡住不动、既不成功也不报错」几乎一定是 wasm 路径错了**：`pal/wasm` 的失败路径是 noop，给你一个永不 settle 的 Promise（§8.3）。别找报错，去查文件在不在。
+- **自动化开预览 URL**：CDP `Page.navigate` 到与当前页**只差 hash** 的 URL 是同文档导航，而 preview **不响应 hashchange 切场景** → 页面原地跑旧场景、新场景的采样永远等不到。自动化逐场景打开时先跳 `about:blank` 再导航目标 URL。
 - **「扩展装了没生效」先去看 `<工程>/temp/logs/project.log`**，别在扩展管理器里瞪着看。加载成功的话你自己 `load()` 里打的日志会出现在里面，`[Package] <name>: …` 和 `Panel(...) is not defined` 那几行 warn 也在，一眼就能分清「没加载」「加载了但没显示」「加载了但某个贡献点没注册」。
 - `<工程>/temp/asset-db/log/*.log` 是导入问题的第一现场。
 - 引擎侧的行为（资源能不能播、属性名对不对）**没法靠 mock 单测**——mock 出来的断言等于把实现抄一遍。把纯计算部分抽成零依赖模块去单测，剩下的消息往返写一份**带症状→成因对照表**的人工验证清单，比假装有覆盖率诚实得多。
-- 格式类输出（`.atlas` / `.plist` / `.anim` / `skeleton.json`）用 **golden 文件逐字节比对**。这几种格式写错的症状都是「能导入但不显示」，没有 golden 守着基本查不出来。
+- **能力探测必须按真实 API 形态写**（2026-09 实证）：探测浏览器「fetch 文本 → Blob URL → Worker」链时写过 `typeof globalThis.createObjectURL === 'function'`——它是 **`URL` 的静态方法**、不是全局函数，恒 `undefined` → worker 档静默回退主线程，A/B 的 worker 组悄悄全是基线（「小游戏里验过、浏览器其实从未真跑过 worker」）。防线：探测函数在真实页面里手验一次，API 名对着 MDN 抄，不凭印象。
+- **降级链任何一级静默 return null 都必须留 warn**（静默降级是 A/B 的天敌）：worker 档取脚本失败曾静默返回 null——对照组与实验组悄悄变成同一实现，「无差异」的假数据比崩溃更难发现。会话级缓存失败结果的场合，warn 天然只打一次，不必担心刷屏。
+- 格式类输出（`.atlas` / `.plist` / `.anim` / `skeleton.json`）用 **golden 文件逐字节比对**。这几种格式写错的症状都是「能导入但不显示」，没有 golden 守着基本查不出来。**插件自带解码器（wasm / JSB）时还有更真的一招**：在 Node 里把生成的数据喂给真实解码器端到端跑一遍（见 §8 清单第 7 条），golden 只证明「和上次一样」，真实解码器才证明「真的能播」。
 
 ## 6. 集成到工程 & 发布前检查
 
@@ -634,9 +625,14 @@ grep -o '"spine-[0-9.]*"' <工程>/settings/v2/packages/engine.json | sort -u
 - 扩展目录里的 `node_modules` 要**在目标工程里装**（`cd extensions/<name> && npm install`），别指望能借到工程或编辑器的依赖。
 - 编译产物尽量**自包含**：让扩展的 `tsconfig.json` 把共享的源码目录一起编译进 `dist`（`rootDir` 指到共同父目录），比引 workspace 软链靠得住。
 - TS 运行时代码 `import from 'cc'` **不需要本地 tsconfig**——类型由挂载它的工程环境提供。编辑器侧脚本是 CommonJS（`require`、全局 `Editor` / `cce`）。**两条线不要混。**
-- 涉及原生：目标引擎必须导出插件用到的引擎能力（例如 `cc.UIMesh` + 公开的 `cc.wasm`）——集成前先确认目标是不是这样的自定义引擎，不是的话原生功能装了也用不了。
+- 涉及原生：目标引擎必须导出插件用到的引擎能力（例如 `cc.UIMesh` + 公开的 `cc.wasm`）——集成前先确认目标是不是这样的自定义引擎，不是的话原生功能装了也用不了。可执行判据：`typeof (cc as any).wasm?.instantiateWasm === 'function'`，或者直接在引擎源码里看 `exports/webassembly.ts` 在不在。**判断不满足时优雅降级（少一个格式 / 少一个特性 + 一条 warning）比装不上要好** —— 插件能在任何 3.8.x 上装得进去，用户才愿意试。另外编辑器用哪个引擎是**全局配置**（§0 的 engine.json），所以「插件在这个工程里能不能跑」很可能取决于用户的全局引擎配置而不是工程本身——集成后先 `head -20 <工程>/temp/logs/project.log` 确认 `Load engine in` 指向的是不是要求的那个引擎。
+- 工程脚本消费挂载运行时（比如给插件写测试场景），导入路径是 **`db://<package.json 的 name>/<runtime 内相对路径去后缀>`** —— db 名取包名，不是扩展目录名（两者一致是惯例不是保证）。实测：`import { Spine, loadSpineRuntime } from 'db://spine-runtime/index'`。
+- 插件新装 / 更新后，工程脚本要 import 它的挂载运行时**必须先重启编辑器**（扩展加载和 `asset-db.mount` 都在启动期）；`temp/logs/project.log` 里能看到扩展加载日志确认。
+- 要在 CLI 里对「引用了挂载运行时的工程脚本」跑 tsc：paths 映射兜住 db:// 导入（`"db://<pkg>/*": ["../extensions/<pkg>/runtime/*"]`）；引擎声明用自定义引擎自己的 `<引擎>/bin/.declarations/cc.d.ts`（没有就 `npm run build:declaration` 生成，别引用工程 `temp/declarations/cc.d.ts` 那个一行桩）。**声明生成器有缺口**：实测 `_decorator.editable/override` 被漏掉（构建日志有 `Don't know how to handle element enable of interface`），加一个 `declare module 'cc'` 的模块增强 d.ts 补齐，别改引擎。完整管线样板：`D:\projects\performance\tools\tsconfig.check.json` + `cc-shim.d.ts`。
+- **改了挂载运行时 / worker bundle 后的免 GUI 重建**（3.8.8 实测）：`CocosCreator.exe --project <工程> --build "logDest=<日志路径>"` —— `--build` **不带构建参数 = 直接用「构建发布面板」保存任务的完整 options**（含 `overwriteProjectSettings` 的 includeModules / macroConfig 覆盖；平台 packages 配置如微信 appid 也会 merge 进来），不需要手工拼 configPath JSON。退出码：36 成功、32 参数不合法、34 构建失败。同工程编辑器 GUI 开着时实测**不撞项目锁**（担心挂死可配 360s 日志监控，无日志即杀）。可比性验证：日志里 `Use cache, md5String: ... includeModules=[...]` 命中引擎构建缓存 = 引擎裁剪与上次构建逐字节同源。⚠ 构建会**重置 `build/` 里的 `project.config.json`**（urlCheck 等手工修改被模板覆盖，出预览码前要重改）。
+- 交付「可裁剪的可选功能」时，README 里写的「不需要就不进包」必须是真的 —— 见 §7.1，Cocos 不做 tree-shaking，这句话在多数人的直觉实现下是假的。
 
-## 7. 参数暴露：一条设计原则
+## 7. 参数暴露与包体
 
 把重活挪到编辑期，换掉的是**运行时成本，不是存储成本**。小游戏 500KB 首包之类的约束一点没变。
 
@@ -644,11 +640,96 @@ grep -o '"spine-[0-9.]*"' <工程>/settings/v2/packages/engine.json | sort -u
 
 配套的一条：**校验函数只放硬错误。** 决定「烘焙按钮能不能点」的那个函数里混进「能跑但不划算」的建议，会把用户拦在一个其实完全合法的参数上。建议另开一条通道显示、不禁用按钮。
 
+### 7.1 Cocos 3.8 不做未引用脚本的 tree-shaking
+
+**脚本目录下的每个脚本都是 bundle 入口。** 场景和 prefab 按 UUID 引用组件，构建器无法证明哪个脚本是死的，所以它一个都不敢删。
+
+测量方法（比读构建器源码快得多）：数产物 `assets/<bundle>/index.js` 里 `_RF.push` 的个数，和源码 `.ts` 的个数比。实测 13 个 `.ts` → **正好 13 个** `_RF.push`，其中包括**没有任何文件 import 的 `index.ts`**、场景引用 0 次的一个 demo 组件，以及编译后本该什么都不剩的**纯 `interface` 文件**。
+
+由此得到一条对功能开关设计的硬约束：
+
+- **「注释掉一行 import / 改一个配置常量」式的裁剪在 Cocos 里是假的。** 它省的是运行时开销（不解析、不加载 wasm、不占内存），**包体一个字节都不少**。给用户一个这样的开关，再在 README 里写「不需要的格式会被裁掉」，是在写一句不成立的话 —— 这个坑我踩过，而且是在自己写的 README 里踩的。
+- 要真的减包体，**文件必须在构建时物理不在挂载目录里**。可行做法：把整组文件（**连同 `.meta`**，UUID 才不变）在 `runtime/` 和一个同级 `trimmed/` 之间**移动**，按编辑期配置（§3.9）在扩展 `load()` 时幂等对齐一次。移动而非「删除 + 从 pristine 拷回」：只有一份拷贝，不会漂移，用户裁剪后提交工程文件仍在他仓库里。
+- 组间的引用集中到一两个**生成文件**里（一个注册表、一个 barrel `index.ts`），文件头写明「生成物，手改会被覆盖」。仓库里提交的是默认全开态，所以默认情况下重新生成是零 diff。
+- 生成文件的「内容没变就不写」判断要**忽略行尾**，并保持文件原有的行尾。`core.autocrlf` 打开的 Windows 检出会把这些文件变成 CRLF，而生成器吐 LF —— 不处理的话每次加载都判定「不一致」并全部重写，churn 掉 mtime 引发无意义的重新导入，正好是这个优化想避免的事。
+- 移完文件要按 §4.3 显式 `refresh-asset`（asset-db 不监听文件系统）。**只读挂载能不能接受 `refresh-asset` 未验证**，所以正确性不要建立在它成功上：给一句「若资源管理器或构建结果没跟着更新，重启一次编辑器」的兜底提示。
+- 一个格式 / 功能往往有**多条互不相干的入包路径**，每条都要单独关。实例：同一个 WebP 支持要关三处 —— 挂载的 TS（文件移走）、`.wasm`（构建钩子跳过复制）、原生 C++（`cc_plugin.json` 的 `platforms` 改成 `[]`，见 §8.1）。漏掉任何一条，「已裁剪」就是假的。**在构建日志里打一行当前生效的功能集合** —— 这通常是产物里到底含什么的唯一信号。
+
+⚠️ 上面 13 → 13 那次是在工程 `assets/` 下的真实目录测的。**`asset-db.mount` 出来的 bundle 是否同样不 tree-shake 尚未单独验证**（没有理由认为不同，但没实测）。要依赖这个结论时先按上面的方法量一次。
+
 ## 8. 原生 C++ / wasm（只在真要跨语言共享同一份逻辑时读）
 
 这一节的复杂度（命名空间隔离、AOT embind、JSB 手动绑定）只在**真的要让 native 和 web 跑同一份 C++ 逻辑**时才值得。纯 TS 组件 + 自定义资源导入，做到 §1–6 就完整可用。
 
 核心结构：**一份 C++ facade 头文件**，JSB（`se::Object` / `se::Class`，`SE_BIND_FUNC`）和 embind（`EMSCRIPTEN_BINDINGS`）各写一层薄绑定，TS 侧按 `NATIVE` 宏**严格二选一**（不是「没有 JSB 就 fallback 到 wasm」）。
+
+### 8.1 `cc_plugin.json` → CMake 全自动接入链路
+
+文件布局与命名约定（出处 `native/cmake/scripts/plugins_parser.js`）：
+
+- `package.json` → `contributions.native.plugins.<任意key>.cc_plugin.json` → `./native/cc_plugin.json`
+- 字段：`name / version / engine-version / author / description / modules / platforms`
+- `native/<平台>/<target>-config.cmake` —— **文件名必须是 `<target>-config.cmake`**，因为生成的是 `find_package(<target> REQUIRED NAMES "<target>")`
+- 平台目录名是固定的（`add_search_path_suffix`，`plugins_parser.js:173`）：`android/`（先找 `android/${ANDROID_ABI}`）、`windows/`（先找 `windows/x86_64`）、`ios/`、`mac/`（先找 `mac/${CMAKE_SYSTEM_PROCESSOR}`）；`iphonesimulator` 回落到 `ios/`
+- **linux / ohos / harmonyos 没有 suffix 映射**（else 分支只 warn 一句 `Don't knowm suffix`）→ 搜索路径为空 → `find_package(... REQUIRED)` 失败。**原生插件机制实际只覆盖 android / windows / ios / mac 四个平台。**
+- `platforms` 的值是**精确字符串匹配** CMake 平台名（`indexOf(PLATFORM_NAME_FROM_CMAKE) < 0` → 跳过），而目录 suffix 那边是正则匹配 —— **两套规则不一样**，`platforms` 里写 `win` 不会生效。反过来用：`platforms: []` 是一个干净的「对所有平台都不接入」开关（比删清单靠错误被吞掉可靠，见下条），适合做 §7.1 那种功能裁剪。
+
+**验证点**：构建后看工程 `native/engine/<平台>/Pre-AutoLoadPlugins.cmake` 里有没有你的 target。
+
+**为什么只能靠这个验证点**：`cc_plugin.json` 的必填字段校验是**死代码**。`plugins_parser.js:141` 的 `field_required` 写的是 `Object.hasOwnProperty(obj, field_name)` —— 在 `Object` 构造器上取 `hasOwnProperty`、把 `obj` 当 key（第二个实参被忽略），键是 `"[object Object]"`，恒 false，于是**恒返回 true，校验永不失败**。漏字段拿不到「field 'x' is not set」，而是后面某处炸掉、被 `for` 循环外层的 try/catch 吞成一行 `console.error`，**插件被整个跳过而构建照常成功**。典型的「症状指向错地方」——你会以为是 CMake 或 C++ 写错了。
+
+### 8.2 `CC_PLUGIN_ENTRY`：JSB 自动注册，不用改工程的 `Game.cpp`
+
+完整链路：`cc_plugin.json` → `Pre-AutoLoadPlugins.cmake` → `find_package` → `<target>-config.cmake` → 你的 `.cmake` 建 STATIC 库 → `CC_PLUGIN_ENTRY` → `templates/cmake/common.cmake:14` 的 `cc_plugin_entry()` 生成 `plugin_registry_autogen.cpp` → `cc_load_all_plugins()` ← `native/cocos/application/BaseGame.cpp:47` 调。**装上插件出普通原生包即自动编译、自动注册，零手工步骤。**
+
+「原生绑定要改工程的 `Game.cpp`」是个很自然但**错**的推断 —— `jsb_module_register.cpp` 里所有 `addRegisterCallback` 都是硬编码的、看不到插件钩子，很容易就此下结论。钩子在 `cocos/plugins/Plugins.h`，不在 bindings 那边。
+
+三个能让你卡住的细节：
+
+- **`CC_PLUGIN_ENTRY(name, fn)` 的 `name` 必须逐字等于 `modules[].target`**，不是 `cc_plugin.json` 的 `name` 字段。因为 autogen 拿 `CC_REGISTERED_PLUGINS`（存的是 target 名）拼 `cc_load_plugin_<target>()`（`common.cmake:28,35`）。
+- 于是 **target 名必须是合法 C 标识符**，只能 `_` 不能 `-`。所以会看到 `name: "spine-runtime"` 而 `target: "spine_runtime"` 这种搭配。写错是链接期 undefined symbol `cc_load_plugin_xxx`。
+- 库必须 `target_compile_definitions(<t> PUBLIC CC_PLUGIN_STATIC)`，否则 `CC_PLUGIN_ENTRY` 走 DLL 导出分支（`Plugins.h:36`）。
+- **不要在静态初始化期调 `se::ScriptEngine::getInstance()`**，那时它是 nullptr。入口函数里只能 `addRegisterCallback(fn)` 排队，真正碰 `se::Object` 的代码在回调里跑。
+
+### 8.3 wasm 在四种宿主下到底去哪找文件
+
+**用 `cc.wasm`，不要自己写 loader** —— 自己写就是绕弯路的根源。自定义引擎 `exports/webassembly.ts` 把 `pal/wasm` 以 `cc.wasm = {instantiateWasm, fetchBuffer, fetchUrl, ensureWasmModuleReady}` 公开。
+
+传进去的是**裸文件名**（`'foo.wasm'`），**不要带目录** —— 各平台自己加前缀：
+
+| 宿主 | `pal/wasm` 实际去哪找 | 传什么 |
+|---|---|---|
+| BUILD（web） | `new URL(name, import.meta.url)` → 产物 `cocos-js/` 旁边 | `'foo.wasm'` |
+| 小游戏 | `cocos-js/<name>`（小米 `src/cocos-js/`、淘宝分包 `__ccWasmAssetSubpkg__/`）交给 `CCWebAssembly.instantiate` | `'foo.wasm'` |
+| EDITOR | node `fs` 读 `<engine>/native/external/<name>` | `'external:foo.wasm'` |
+| PREVIEW | `fetch('/engine_external/?url=external:foo.wasm')` | `'external:foo.wasm'` |
+
+（出处 `pal/wasm/wasm-web.ts` 的 `fetchBuffer`、`pal/wasm/wasm-minigame.ts` 的 `getPlatformBinaryUrl`。）
+
+- **小游戏的 `CCWebAssembly.instantiate` 只吃路径、不吃字节** —— 这是 base64 内嵌 / `SINGLE_FILE` 方案在微信上跑不起来的根因，也是必须留一个独立 `.wasm` + `instantiateWasm` hook 的原因。
+- 微信多线程 Worker（旧版约束 + 新版 V2 灰度的 OffscreenCanvas / SharedArrayBuffer / worker 内 wx API / 多 worker）的完整参考，拆到了独立的 **wechat-minigame-worker** skill。对 wasm 交付影响最大的几条：**worker 目录只能放 JS**（`.wasm` 必须放外面）、postMessage 是拷贝、旧版及未灰度环境**同时最多 1 个 worker**——「解码器搬进 worker」的设想先过那边的约束表。
+- 于是交付要**两条**：`main.js` 的 `load()` 拷到 `(await Editor.Message.request('engine','query-engine-info')).native.path + '/external/'`（管 EDITOR + PREVIEW），`contributions.builder` 的 `onAfterBuild` 拷进产物 `cocos-js/`（管 web + 小游戏）。**编辑器场景视图不走预览 HTTP 服务器**，所以只做 HTTP 那条覆盖不到场景视图。
+- ⚠️ **最值钱的一条：`pal/wasm` 的 `fetchBuffer` 失败路径是 `// noop`，既不 resolve 也不 reject。** 路径错了拿到的是一个**永不 settle 的 Promise** —— 没有任何报错，加载悄悄卡住，`await` 永远不返回。小游戏那边同样是 `.catch((e) => {})`。所以「wasm 加载没反应」要先按上面那张表查文件在不在，**不要去找报错，没有报错**。
+- `cc.wasm` **没有 `.d.ts`**，TS 侧必须 `(cc as any).wasm`，否则目标工程 typecheck 挂。可执行的能力判据见 §6。
+- Emscripten 侧的接入点是 module option `instantiateWasm(imports, successCallback)`（老式单回调形态）。**hook 里 throw / reject 传不出去**（glue 不接），失败必须 reject 一个自己持有的外层 Promise —— 引擎自己的 spine / physx adapter 也有同样的注意事项。
+- ⚠️ **`WebAssembly.instantiate` 两种入参的 resolve 形态不同**（worker 侧给 glue 的 `instantiateWasm` 回调喂 instance 时踩过）：传**已编译 Module**（Module 可结构化克隆、**严禁进 transfer 列表**）resolve 的直接是 **instance**；传 **bytes** 重载 resolve 的是 `{module, instance}` 二元组。两态混用时拿到 undefined 字段、报错点却在几行之外。
+- ⚠️ **wasm 内部 C++ assert 的死法是 `RuntimeError: Aborted(Assertion failed: …)`**（emscripten abort 而非 JS 异常；2026-09 坏 JSON 喂 spine-cpp Json.cpp:120 实证）：worker **不死**，后续消息照常处理；错误对象跨 realm `e instanceof Error` 为 **false**（好在 `message` 字段还在，兜底用 `String(e)`）。错误路径测试按这个形态断言。
+
+### 8.4 `contributions.builder` 的形态
+
+- 两个文件：`builder.js` 只有一行 `exports.configs = { '*': { hooks: './hooks' } }`；`hooks.js` 导出 `onAfterBuild(options, result)`。
+- 产物目录要**同时试** `result.dest` 和 `result.paths.output`（两种形态都出现过）。
+- 原生平台要跳过（走 JSB，不需要 `.wasm`）。
+- **钩子里 throw 会弄挂整个构建** → 全包 try/catch，只 log。为一个可选 codec 的载荷弄挂整个构建是完全不成比例的后果。
+- 钩子跑在 **builder 的 worker 进程**里，那里**拿不到 `Editor.*`**。要读编辑期配置（§3.9）就派生一份纯 JSON 到扩展目录，钩子用 `fs` 读；文件缺失 / 解析失败一律当「全开」，这样没打开过面板的用户拿到的就是原本的行为。
+
+### 8.5 Emscripten 链接选项里几个不显然但必需的
+
+- **`-mno-reference-types -mno-bulk-memory`**：微信的 wasm 校验器只认 MVP 的 `call_indirect` 编码，带上新特性直接拒。
+- **`-s DYNAMIC_EXECUTION=0`**：小游戏禁 `eval` / `new Function`。用 embind 时要配 **`EMBIND_AOT=1`**；接口只有几个函数的话别用 embind，纯 C ABI + `cwrap` 更省。
+- `MODULARIZE=1 EXPORT_ES6=1 EXPORT_NAME=X`、`FILESYSTEM=0 NO_EXIT_RUNTIME=1 ALLOW_MEMORY_GROWTH=1`。
+- glue 是 ESM，但**挂载进工程的 `.js` 被当 CJS** → 必须转换：干掉 `import.meta.url`、`new URL('x.wasm', import.meta.url).href` → `"x.wasm"`、中和环境探测守卫（改成 `if (false && …)`，小游戏 / 编辑器 scene worker 的环境和浏览器不同）、中和 `throw new Error('environment detection error')`、`export default` → `module.exports`。
+- 提交 `.wasm` 进仓库时在 `.gitattributes` 里写明 `*.wasm binary`。git 靠 `\0asm` 魔数开头的 NUL 也能推断出二进制，但**别依赖内容嗅探**：`.wasm` 被 CRLF 转换弄坏的表现是上面那条「永不 settle 的 Promise」，即最难查的那种。
 
 ### 新增一个原生绑定函数的检查清单
 
@@ -665,13 +746,53 @@ grep -o '"spine-[0-9.]*"' <工程>/settings/v2/packages/engine.json | sort -u
    ```
    glue 生成脚本**默认从 `prebuilt/` 读输入**，不会自动用刚编译出的 `build/`。实际踩过的坑：编译成功但忘了带参数，生成的 glue 还是旧的。
 6. JSB 侧不需要额外步骤（随正常原生工程构建）。但本地没有 emsdk 时，wasm 那侧就是「源码改完但产物没更新」的半成品，**必须明确告知用户**。
-7. 验证 embind 绑定最快的方式：写个 Node 脚本 `require()` 编译出的 CJS glue + `fs.readFileSync` 对应 `.wasm`，手动 `instantiateWasm` 后直接调新函数。比在编辑器里反复试错快得多。
+7. 验证 embind 绑定最快的方式：写个 Node 脚本 `require()` 编译出的 CJS glue + `fs.readFileSync` 对应 `.wasm`，手动 `instantiateWasm` 后直接调新函数。比在编辑器里反复试错快得多。**同一个 harness 也是验证「喂给插件的数据」的最好工具**：生成的 spine JSON / atlas 之类格式数据，错了的症状是静默丢 region 或干脆不渲染；在 Node 里把 解析 → 建实例 → 出渲染几何 全链路跑一遍，一次把数据格式和绑定正确性都盖上（样板：`D:\projects\performance\tools\verify-spine-data.mjs`）。
 
 ### 原生侧的其他坑
 
-- 双 spine / 双同名 C++ 库共存要做命名空间隔离（`COMPILE_DEFINITIONS "spine=spine43"` 这类手法），否则**链接期静默选错符号**。
+- 双 spine / 双同名 C++ 库共存要做命名空间隔离（`COMPILE_DEFINITIONS "spine=spine43"` 这类手法），否则**链接期静默选错符号**。再加一种场合：`native/external/` 里引擎预编译的第三方库，**各平台 `include/` 内容不一样**（实例：webp 在 android/ohos 只有 `decode.h`，win64/openharmony 才有 `demux.h`）。vendor 源码补功能时，自己那份公共头**写成一行转发到引擎按平台提供的那份**，让 ABI 常量和结构体布局始终跟实际链接的库一致而不是跟你 vendor 的版本一致；再用 `-include` 前缀头把 vendored 的符号整族重命名，这样在「本来就带这个模块」的平台上也不撞符号 —— 比按平台写 CMake 条件分支省事。
 - JSB staging buffer 要显式复制，别持有引擎内部指针。
 - 顶点格式要对齐，错位的症状是画面撕裂而不是崩。
-- 小游戏平台有动态执行限制，`eval` 路线的绑定方案在那里跑不起来。
-- Native Simulator 不是普通原生工程，别拿它的结果推断真机。
+- 小游戏平台有动态执行限制，`eval` 路线的绑定方案在那里跑不起来（具体链接选项见 §8.5）。
+- **Native Simulator 与真机不同构，插件能不能带取决于引擎**（2026-09 实测定案，取代早先「未验证」的推断）：**stock 引擎的模拟器仍不带插件**（configure 从不调插件发现链，`globalThis.<binding>` 不存在）；**自定义引擎可加 `-DSIMULATOR_PLUGIN_SCAN_DIRS` opt-in**（引擎侧约 20 行，见 §9.5）让模拟器走与真机完全相同的发现链，装上即 `cc_load_all_plugins()` 注册 JSB（在模拟器 V8 里实测可见 `globalThis.spineruntime`）。原 `-DCMAKE_PROJECT_INCLUDE=<target>_simulator.cmake` 路线作废——那是把插件逻辑塞进模拟器构建的 workaround。配套不变：TS 侧 `if (NATIVE) { if (!binding) throw }`，**不要在原生上回退 wasm** —— 那会把「原生没接上」掩盖成「能跑但慢」，这种问题没人会注意到。模拟器预览本身的 staging 管线与黑屏排查见 §9。
 - 自定义 UIMesh 类组件的生命周期方法**必须调 `super.onLoad()`**，漏了表现为不渲染。
+- 两个后端（JSB / wasm）共用同一份 C 内核时，**逐帧输出必须逐字节相同**，拿一份公开语料的 md5 清单当 golden 去比 —— 「两边都能跑」和「两边结果一样」是两件事。
+
+## 9. 模拟器预览（原生 exe）：黑屏排查与自动化（2026-09 实测）
+
+模拟器预览不是浏览器预览换个壳——它是编辑器**staging 一份 JS 进预编译 exe** 里跑。自定义引擎下有两个结构性缺口，症状都是「窗口纯黑/纯白、零报错」，且**都不是插件的错**（插件 JSB 在黑屏实例里就已注册，可用 §9.4 直连验证）。
+
+### 9.1 staging 管线：每次点预览都重做一遍（builtin preview 扩展 `browser/simulator.ts`）
+
+1. 按工程勾选的模块生成 ~6KB `cc.js` 桩：`System.register(["2d", …, "webassembly", …])` —— **桩的 deps = 工程选定的 feature units，也是「模拟器必须能加载什么」的权威清单**（排查时直接数它）。
+2. `<引擎>/bin/native-preview/` → `Release/src/cocos-js/`。**目录不存在时 `pathExistsSync` 静默跳过**——cocos-js 里只剩那个 6KB 桩就是这条路断了。
+3. **`Release/src/import-map.json` 被编辑器安装目录 `resources/app.asar.unpacked/builtin/preview/static/simulator/import-map.json` 无条件覆盖**——你手工修 staged 那份只能活到下一次点击。
+4. spawn `SimulatorApp-Win32.exe -workdir <Release> -writable-path <Release>`。
+
+运行期 import-map 三层解析（staged `main.js`）：本地 `./src/import-map.json`（`cc-fu/*` → `./cocos-js/*.js`）→ 工程服务器 `http://<ip>:<port>/scripting/x/import-map.json`（其 `scopes` 把 chunk 的 `__unresolved_N` 映射到**裸 cc-fu id**）→ 基础 `{'cc':'cce:/internal/x/cc'}`。裸 id 本地 map 没有 → 直接挂。
+
+### 9.2 自定义引擎黑屏的两个根因（按此顺序判）
+
+1. **`bin/native-preview` 没人构建**：编辑器从不自动编译模拟器引擎 TS，唯一产出方是 开发者→编译模拟器引擎（只编译TS代码）菜单。症状：`Module no-schema:/src/cocos-js/2d.js did not instantiate (SystemJS Error#2)`。
+2. **编辑器安装目录的 import-map 是 stock 引擎的 feature 表**：缺自定义引擎新增的 unit（实例：`cc-fu/webassembly`），工程 chunk 的 scope 引用裸 id → `Unable to instantiate cce:/internal/x/cc-fu/webassembly from …/chunks/…`。判法：比对 cc.js 桩 deps vs import-map keys vs cocos-js 里实际存在的 `<dep>.js`。
+
+### 9.3 自动化杠杆：消息路由没有权限门槛
+
+路由实现在 `@editor/creator/dist/message/protected/browser/index.jsg`（gzip，解压可读）：`request()` 只查 `messageMap[pkg][msg]` **存在性，无任何 public/权限检查** → 任何扩展可以 `Editor.Message.request('preview', 'build-simulator-engine-ts')` 调编辑器自己的构建器（与开发者菜单同一条 dispatch）。其非打包分支用 `query-engine-info` 的引擎路径：**同时重建 `bin/native-preview` 并重写安装目录 import-map（含该引擎全部 feature units）**——一次调用根治两个缺口，且零逻辑复刻、不手写编辑器目录。缺口检测全只读：native-preview 空？桩每个 dep 有文件、map 有键？样板：spine-runtime 扩展 `editor/simulator.js` 的 `ensureSimulatorEngineTS()`。
+
+- 不想走消息时的头less 复刻（诊断用）：require **引擎自己的** `@cocos/ccbuild`（`{buildEngine, StatsQuery}`），options 逐项抄 `build-simulator-engine-ts.ts`：`moduleFormat:'system', compress:false, targets:'chrome 80', split:true, nativeCodeBundleMode:'wasm', platform:'WINDOWS', mode:'PREVIEW', flags:{DEBUG:true,SERVER_MODE:false}`，features = 全部 − gfx-webgpu − vendor-google − spine-* 再单选一个 spine 版本。
+- ⚠️ 构建器第一步 `emptyDirSync(native-preview)`：后台构建期间用户点预览会 stage 到半空目录（照样黑屏）。编辑器也没有「预览前」钩子，接受「构建窗口内点击失败、完成后自愈」并在控制台说明。
+
+### 9.4 直连模拟器 V8（CDP，零改源码的黑屏诊断法）
+
+`%LOCALAPPDATA%\SimulatorApp-Win32\debugruntime\config.json` 记 `debugPort`（5086 起），**实例占用时端口顺延**——以 netstat 按 exe pid 查到的为准，别信配置里的数。`http://127.0.0.1:<port>/json/list` 拿 `webSocketDebuggerUrl`，node ≥22 自带 `WebSocket`。`Runtime.enable` 后用 `Runtime.evaluate {returnByValue, awaitPromise}` + `consoleAPICalled`/`exceptionThrown` 事件：`typeof cc`、场景树 walk（`c.__classname__`）、`cc.find('Canvas/…')`、XHR 探针、`typeof globalThis.<插件binding>`——「加载挂在哪一层」十分钟内定位，比截图猜快一个量级。
+
+### 9.5 模拟器原生插件（引擎侧 opt-in，与真机同构）
+
+引擎侧约 20 行（cocos4 `feat/plugin_support` 实测）：`templates/cmake/common.cmake` 的 `cc_gen_plugin_cmake_hook()` 扫描根 `CC_PLUGIN_PATH` 允许调用方预置；模拟器 CMakeLists 加 `SIMULATOR_PLUGIN_SCAN_DIRS` CACHE 变量（进 CMakeCache，后续 `cmake --build` 不必重传）走同一条 parser → `Pre-AutoLoadPlulgins.cmake` → `find_package` → `plugin_registry` 链；`Game.cpp` 补 `cc_load_all_plugins()`（模拟器的 Game 直接继承 CocosApplication，绕过了 `BaseGame::init()` 里的调用点——这就是插件链断的运行期原因）。**引擎 diff 里零插件名**：插件集永远是扫描结果这份数据。扩展侧用 stamp + 扫描根内容哈希守着，变了才后台 cmake（样板同 `editor/simulator.js`）。两个 CMake 坑：`target_link_libraries` 同一 target **混用 plain/keyword 签名是硬错误**（追加保持 plain）；parser 的不变量是「输出文件目录 == `CC_PROJECT_DIR`」（指到构建树内目录即可满足）。
+
+### 9.6 Windows / PowerShell / git 工具链坑（通用，非模拟器专属）
+
+- PS 5.1 `Set-Content -Encoding utf8` 写 **BOM** → V8 `JSON.parse` 报 `SyntaxError: Unexpected token '﻿'`（报错里那个不可见字符就是 BOM）。写任何会被 JS 读的 JSON 用 `[IO.File]::WriteAllText($f, $json, (New-Object System.Text.UTF8Encoding($false)))`。
+- PowerShell 里 `stash@{0}` 是哈希表语法，要引号 `'stash@{0}'`；`git commit --fixup=<sha>` **不会自动 stage**，先 `git add`。
+- 想给历史深处的提交补改动又不能用交互式 rebase 时：`git commit --fixup=<sha>` + `GIT_SEQUENCE_EDITOR=<脚本>` 的 `rebase -i --autosquash`，脚本（node 单文件）直接重写 todo 再退出，全程无真编辑器。
